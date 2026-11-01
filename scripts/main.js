@@ -1,222 +1,287 @@
-let diffs = {};
-const historyTimeSpan = 1; // Time in seconds over which to check changes
-const rebuildInterval = 200; // ms between UI rebuilds (~5/sec)
-const showThreshold = 5; // Show resources with at least this many items
-const hideThreshold = 0; // Hide resources when they drop to this or below
-const flickerWindow = 3000; // ms - if a resource reappears within this window, treat as flickering
+// Resource Rate Monitor
+// Shows per-resource production/consumption rates in the core item display.
+//
+// Platforms:
+// - desktop: replaces the vanilla core item widget inside the "coreinfo" HUD table
+// - mobile (Android + iOS): the vanilla core widget is collapsed on mobile, so this
+//   mod adds its own table under the wave panel instead
+//
+// iOS notes:
+// - mod.hjson must declare iosCompatible: true (no JavaAdapter / extend() here)
+// - iOS runs Rhino interpreted, so keep per-frame work small: the table is only
+//   rebuilt when the visible item set or column count changes, values update in place
 
-let contentTable;
-let coreItemsCollapser;
+const SAMPLE_MS = 1000; // rate sampling window
+const TICK_MS = 100; // logic refresh
+const SHOW_AT = 5; // show a resource once it reaches this amount
+const HIDE_AT = 0; // hide it again at or below this amount
+const FLICKER_MS = 3000; // reappearing under SHOW_AT within this window means flickering
+const COLUMN_OPTIONS = [4, 5, 6, 7, 8];
 
-let isInjected = false;
-let injectTimer;
-let lastRebuildTime = 0;
-
-const columnOptions = [4, 5, 6, 7, 8];
+let diffs = {}; // item id -> state
 let columnIndex = 0;
-let visibleResourceCount = 0;
+let visibleCount = 0;
+
+let desktopWrapper, desktopContent, desktopCollapser;
+let mobileRoot, mobileContent, mobileCell;
+let lastPadTop = -1, lastPadLeft = -1;
+
+let lastTick = 0;
+let lastSignature = null;
 
 Events.on(ClientLoadEvent, () => {
-    contentTable = new Table(Styles.black6);
-    contentTable.touchable = Touchable.enabled;
-    contentTable.pack();
-
-    coreItemsCollapser = Vars.ui.hudGroup.find('coreinfo').getChildren().get(1).getChildren().get(0);
-
-    diffs = {};
-    isInjected = false;
-
-    // Cancel any previous timer before scheduling a new one
-    if (injectTimer) injectTimer.cancel();
-
-    injectTimer = Timer.schedule(() => {
-        if (!isInjected) {
-            injectTable();
-        } else {
-            injectTimer.cancel();
-            injectTimer = null;
-        }
-    }, 0, 3);
+    reset();
+    buildDesktop();
+    buildMobile();
 });
 
 Events.on(WorldLoadEvent, () => {
-    diffs = {};
-    isInjected = false;
-    lastRebuildTime = 0;
-
-    // Re-start injection polling in case UI was rebuilt between maps
-    if (injectTimer) injectTimer.cancel();
-    injectTimer = Timer.schedule(() => {
-        if (!isInjected) {
-            injectTable();
-        } else {
-            injectTimer.cancel();
-            injectTimer = null;
-        }
-    }, 0, 3);
+    reset();
 });
 
 Events.run(Trigger.update, () => {
-    if (isInjected) {
-        const now = Time.millis();
-        if (now - lastRebuildTime >= rebuildInterval) {
-            rebuildTable();
-            lastRebuildTime = now;
-        }
+    const now = Time.millis();
+    if (now - lastTick < TICK_MS) return;
+    lastTick = now;
+
+    if (!Vars.state.isGame()) return;
+
+    if (!Vars.mobile) tryInjectDesktop();
+    if (Vars.mobile) {
+        updateMobileLayout();
+        // note: Element.visible is a boolean field, so it is assigned directly
+        // instead of using the Boolp overload (which Rhino cannot resolve)
+        mobileRoot.visible = Vars.ui.hudfrag.shown && !Vars.state.isMenu() && !Vars.state.isEditor();
+    }
+
+    const list = sample(now);
+
+    // only rebuild when the item set or column count changes; labels update themselves
+    const signature = columnIndex + '|' + list.map(item => item.id).join(',');
+    if (signature != lastSignature) {
+        lastSignature = signature;
+        rebuild(list);
     }
 });
 
-function injectTable() {
-    if (!isInjected) {
-        const resourceTable = createTable(contentTable);
-        isInjected = true;
-        coreItemsCollapser.setTable(resourceTable);
+function reset() {
+    diffs = {};
+    lastSignature = null;
+    desktopCollapser = null;
+    lastPadTop = -1;
+    lastPadLeft = -1;
+}
+
+function buildDesktop() {
+    desktopContent = new Table(Styles.black6);
+    desktopContent.margin(4);
+    desktopContent.touchable = Touchable.enabled;
+
+    desktopWrapper = new Table();
+    desktopWrapper.touchable = Touchable.enabled;
+    desktopWrapper.add(desktopContent);
+    desktopWrapper.row();
+    desktopWrapper.clicked(cycleColumns);
+}
+
+function buildMobile() {
+    if (mobileRoot != null) return;
+
+    mobileContent = new Table(Styles.black6);
+    mobileContent.margin(4);
+    mobileContent.touchable = Touchable.enabled;
+    mobileContent.clicked(cycleColumns);
+
+    mobileRoot = new Table();
+    mobileRoot.setFillParent(true);
+    mobileRoot.top().left();
+    mobileRoot.touchable = Touchable.childrenOnly;
+    mobileCell = mobileRoot.add(mobileContent).left();
+
+    Vars.ui.hudGroup.addChild(mobileRoot);
+}
+
+function tryInjectDesktop() {
+    // re-inject if the HUD was rebuilt and our collapser was detached
+    if (desktopCollapser != null && desktopCollapser.getScene() == null) desktopCollapser = null;
+    if (desktopCollapser != null) return;
+
+    const coreInfo = Vars.ui.hudGroup.find('coreinfo');
+    if (coreInfo == null || coreInfo.getChildren().size < 2) return;
+
+    const inner = coreInfo.getChildren().get(1);
+    if (inner == null || inner.getChildren().size < 1) return;
+
+    const collapser = inner.getChildren().get(0);
+    if (!(collapser instanceof Collapser)) return;
+
+    collapser.setTable(desktopWrapper);
+    desktopCollapser = collapser;
+}
+
+function updateMobileLayout() {
+    if (mobileRoot == null) return;
+
+    // anchor directly under the wave panel: same column, one small gap below it
+    // ("waves/editor" is the stack holding the wave panel and the editor panel)
+    const stack = Vars.ui.hudGroup.find('waves/editor');
+
+    let padTop, padLeft;
+    if (stack != null) {
+        const bottom = stack.localToStageCoordinates(Tmp.v1.set(0, 0));
+        padTop = Core.scene.getHeight() - bottom.y + Scl.scl(4);
+        padLeft = bottom.x;
+    } else {
+        // fallback for a HUD without the wave stack: keep clear of the mobile button row
+        padTop = Core.scene.marginTop + Scl.scl(160);
+        padLeft = Scl.scl(4);
+    }
+
+    if (Math.abs(padTop - lastPadTop) > 0.5 || Math.abs(padLeft - lastPadLeft) > 0.5) {
+        lastPadTop = padTop;
+        lastPadLeft = padLeft;
+        mobileCell.padTop(padTop).padLeft(padLeft);
+        mobileRoot.invalidateHierarchy();
     }
 }
 
-function createTable(table) {
-    const tableW = new Table();
-    tableW.touchable = Touchable.enabled;
-    tableW.add(table);
-    tableW.row();
+function sample(now) {
+    const items = Vars.player.team().items();
+    const list = [];
 
-    // Cycle column count on click, reset to 4 if next option exceeds visible resources
-    tableW.clicked(() => {
-        const nextIndex = (columnIndex + 1) % columnOptions.length;
-        if (columnOptions[nextIndex] > visibleResourceCount) {
-            columnIndex = 0;
-        } else {
-            columnIndex = nextIndex;
-        }
-    });
-
-    return tableW;
-}
-
-function rebuildTable() {
-    contentTable.clearChildren();
-    buildTable();
-}
-
-function buildTable() {
-    const resourcesTable = contentTable.table().get();
-    const currentItems = Vars.player.team().items();
-    const activeItems = {};
-    let i = 0;
-
-    currentItems.each((item, amount) => {
-        if (!diffs[item]) {
-            diffs[item] = {
+    items.each((item, amount) => {
+        let d = diffs[item.id];
+        if (d == null) {
+            d = diffs[item.id] = {
+                amount: amount,
                 lastAmount: amount,
-                lastTimestamp: Time.millis(),
-                displayValue: 0,
-                visible: false,
+                lastTime: now,
+                rate: 0,
+                smoothed: new WindowedMean(4),
+                visible: amount >= SHOW_AT,
                 flickering: false,
-                lastSeenBelow: 0 // Last time we saw this resource below showThreshold but > 0
+                lastSeenBelow: 0
             };
         }
 
-        let diff = diffs[item];
-        const currentTime = Time.millis();
+        d.amount = amount;
 
-        // Detect flickering: resource keeps appearing below threshold
-        if (amount > 0 && amount < showThreshold) {
-            if (diff.lastSeenBelow > 0 && currentTime - diff.lastSeenBelow < flickerWindow) {
-                // Seen below threshold again recently — it's flickering
-                diff.flickering = true;
+        // flicker: a resource that keeps reappearing under the display threshold
+        if (amount > 0 && amount < SHOW_AT) {
+            if (d.lastSeenBelow > 0 && now - d.lastSeenBelow < FLICKER_MS) {
+                d.flickering = true;
             }
-            diff.lastSeenBelow = currentTime;
-        } else if (amount >= showThreshold) {
-            // Solidly above threshold — stop flickering state
-            diff.flickering = false;
-            diff.lastSeenBelow = 0;
+            d.lastSeenBelow = now;
+        } else if (amount >= SHOW_AT) {
+            d.flickering = false;
+            d.lastSeenBelow = 0;
         }
 
-        // Decide visibility
-        if (diff.flickering) {
-            // Flickering resources always show
-            diff.visible = true;
-        } else if (amount >= showThreshold) {
-            diff.visible = true;
-        } else if (amount <= hideThreshold) {
-            diff.visible = false;
+        if (d.flickering || amount >= SHOW_AT) {
+            d.visible = true;
+        } else if (amount <= HIDE_AT) {
+            d.visible = false;
         }
-        // If between hideThreshold and showThreshold and not flickering,
-        // keep previous visible state (hysteresis)
+        // between HIDE_AT and SHOW_AT keep the previous state, so it does not blink
 
-        if (!diff.visible) return;
-
-        activeItems[item] = true;
-
-        // Calculate and update the display value only once per time span
-        if (currentTime - diff.lastTimestamp >= 1000 * historyTimeSpan) {
-            diff.displayValue = amount - diff.lastAmount;
-            diff.lastAmount = amount;
-            diff.lastTimestamp = currentTime;
+        // rate in items per second, normalized by the real elapsed time, then smoothed
+        // since the sample window can never line up exactly with one second
+        const elapsed = now - d.lastTime;
+        if (elapsed >= SAMPLE_MS) {
+            d.rate = (amount - d.lastAmount) * 1000 / elapsed;
+            d.smoothed.add(d.rate);
+            d.lastAmount = amount;
+            d.lastTime = now;
         }
 
-        const difference = diff.displayValue;
-        let color = '[white]';
-        let sign = '+';
-
-        if (diff.flickering) {
-            color = '[yellow]';
-            sign = '~';
-        } else if (difference > 0) {
-            color = '[#8585FF]';
-        } else if (difference < 0) {
-            color = '[red]';
-            sign = '-';
-        }
-
-        // Low-stock warning: losing resources and <10 seconds of supply left
-        let amountColor = '[white]';
-        if (!diff.flickering && difference < 0 && amount / Math.abs(difference) <= 10) {
-            amountColor = '[red](!) ';
-        }
-
-        const displayDiff = diff.flickering
-            ? sign + padNumber(0)
-            : sign + padNumber(Math.abs(difference));
-
-        resourcesTable.image(item.uiIcon).left();
-        resourcesTable.label(() => amountColor + numberToString(amount) + '[white]').padLeft(2).left().padRight(1);
-        resourcesTable.label(() => '(' + color + displayDiff + '[white])').left().padRight(2);
-
-        if (++i % columnOptions[columnIndex] == 0) {
-            resourcesTable.row();
-        }
+        if (d.visible) list.push(item);
     });
 
-    // Prune stale entries that are no longer in the current item set
-    for (let key in diffs) {
-        if (!activeItems[key]) {
-            // Keep flickering entries alive until the window expires
-            if (diffs[key].flickering && Time.millis() - diffs[key].lastSeenBelow < flickerWindow) {
-                continue;
-            }
-            delete diffs[key];
+    visibleCount = list.length;
+    return list;
+}
+
+function rebuild(list) {
+    const content = Vars.mobile ? mobileContent : desktopContent;
+    if (content == null) return;
+
+    content.clearChildren();
+
+    const columns = COLUMN_OPTIONS[columnIndex];
+    let i = 0;
+
+    for (let n = 0; n < list.length; n++) {
+        const item = list[n];
+        const id = item.id;
+
+        content.image(item.uiIcon).left().padRight(2);
+        content.label(() => amountText(id)).left().padRight(2);
+        content.label(() => rateText(id)).left().padRight(8);
+
+        if (++i % columns == 0) content.row();
+    }
+}
+
+function amountText(id) {
+    const d = diffs[id];
+    if (d == null) return '';
+
+    const rate = rateOf(d);
+    const warn = !d.flickering && rate < 0 && d.amount / -rate <= 10;
+    const key = d.amount + '|' + warn;
+
+    // labels call this every frame, so only rebuild the string when something changed
+    if (d.amountKey != key) {
+        d.amountKey = key;
+        d.amountStr = (warn ? '[red](!) [white]' : '') + formatAmount(d.amount);
+    }
+    return d.amountStr;
+}
+
+function rateText(id) {
+    const d = diffs[id];
+    if (d == null) return '';
+
+    const key = d.flickering ? 'f' : '' + Math.round(rateOf(d));
+    if (d.rateKey != key) {
+        d.rateKey = key;
+
+        if (d.flickering) {
+            d.rateStr = '([yellow]~0[white])';
+        } else {
+            const rate = Math.round(rateOf(d));
+            d.rateStr = rate > 0 ? '([#8585FF]+' + formatAmount(rate) + '[white])'
+                : rate < 0 ? '([red]-' + formatAmount(-rate) + '[white])'
+                : '([lightgray]0[white])';
         }
     }
-
-    // Track visible count for column cycling
-    visibleResourceCount = i;
-
-    contentTable.row();
+    return d.rateStr;
 }
 
-function padNumber(num) {
-    return num.toString().padStart(2, '0');
+function rateOf(d) {
+    return d.smoothed.hasEnoughData() ? d.smoothed.mean() : d.rate;
 }
 
-function numberToString(num) {
-    if (num < 0) return '-' + numberToString(Math.abs(num));
-    if (num < 1000) return num.toString();
+function cycleColumns() {
+    const next = (columnIndex + 1) % COLUMN_OPTIONS.length;
+    columnIndex = COLUMN_OPTIONS[next] > visibleCount ? 0 : next;
+    lastSignature = null;
+}
+
+function formatAmount(num) {
+    if (num < 1000) return Math.round(num).toString();
 
     const units = ['k', 'M', 'B', 'T'];
-    const order = Math.min(Math.floor(Math.log10(num) / 3), units.length);
-    const unitname = units[order - 1];
-    const numStr = (num / Math.pow(1000, order)).toPrecision(3);
+    let order = 0;
+    let value = num;
 
-    return numStr + unitname;
+    while (value >= 1000 && order < units.length) {
+        value /= 1000;
+        order++;
+    }
+
+    let text = value >= 100 ? value.toFixed(0) : value >= 10 ? value.toFixed(1) : value.toFixed(2);
+    text = text.replace(/\.0+$/, '').replace(/(\.\d)0$/, '$1');
+
+    return text + units[order - 1];
 }
