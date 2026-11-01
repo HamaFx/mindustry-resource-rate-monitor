@@ -1,11 +1,9 @@
 # Resource Rate Monitor
 
-Shows how fast each core resource is being produced or consumed, right in the HUD.
+Shows how fast each core resource is being produced or consumed, plus your power balance, right in the HUD.
 
 Fork of [derekShaheen/Mindustry-Resource-Rate-Monitor](https://github.com/derekShaheen/Mindustry-Resource-Rate-Monitor)
-(MIT, by Skrip) with mobile and iOS support and a rewritten rate sampler.
-
-![Screenshot](media/Screenshot%202024-05-25%20020010.png)
+(MIT, by Skrip) with mobile and iOS support, a power row, a display toggle and a rewritten rate sampler.
 
 ## Features
 
@@ -13,8 +11,10 @@ Fork of [derekShaheen/Mindustry-Resource-Rate-Monitor](https://github.com/derekS
 - Rate colors: gaining, losing, stable
 - `(!)` low-stock warning when a resource has under 10 seconds of supply left
 - Flicker detection for resources that are consumed as fast as they arrive (`~0`)
+- Power row with production, consumption and the net balance, plus a shortage warning
+- Eye button hides or shows the readout, and the choice is remembered
+- List button cycles the column count (4 to 8)
 - Compact number formatting (1.5k, 2.3M, 12.4B)
-- Tap or click the table to cycle the column count (4 to 8)
 - Works on desktop, Android and iOS
 
 ## Platforms
@@ -40,8 +40,10 @@ Manual installation works too: download this repository as a zip and import it f
 
 ## Usage
 
-Once installed and enabled, the rate display is automatic. Tap or click it to cycle the
-number of columns.
+Once installed and enabled, the readout is automatic.
+
+- **Eye button**: hide or show the readout. The state is saved, so it stays hidden across restarts.
+- **List button**: cycle the column count between 4 and 8.
 
 ## How it works
 
@@ -54,5 +56,12 @@ rate = (amount - lastAmount) * 1000 / elapsedMilliseconds
 
 A resource is shown once it holds at least 5 items, and hidden again at 0. Resources that
 keep reappearing below the threshold within 3 seconds are treated as flickering and shown
-as `~0`. The table is only rebuilt when the visible item set changes, so per-frame work
-stays small on mobile.
+as `~0`.
+
+Power is summed over every network owned by your team. Production is read per tick, so it
+does not depend on the frame rate, the net balance comes from the game's own power graph
+average, and consumption is derived from the two so the numbers always agree. A red `(!)`
+marks a network running at a deficit.
+
+The table is only rebuilt when the visible item set, the power row or the column count
+changes, and label text is cached, so per-frame work stays small on mobile.

@@ -3,17 +3,19 @@
     displayName: "[orange]Resource Rate Monitor"
     author: Skrip, HamaFx
     description: '''
-    Monitor your resource rate changes in real time.
+    Monitor your resource rate changes and power use in real time.
 
     Features:
-    - Color-coded rate display: [#8585FF]gaining[], [red]losing[], [white]stable[]
+    - Color-coded item rate display: [#8585FF]gaining[], [red]losing[], [white]stable[]
+    - Power row showing production/consumption and the net balance, with a shortage warning
     - [red](!)[] Low-stock warning when a resource is under 10 seconds from depletion
     - [yellow]Flicker detection[] for resources being consumed as fast as they arrive (~0)
-    - Tap or click the resource table to cycle column count (4-8)
+    - Eye button hides or shows the display, and the choice is remembered
+    - Tap or click the table to cycle column count (4-8)
     - Compact number formatting (1.5k, 2.3M, etc.)
     - Works on desktop, Android and iOS
     '''
-    version: "0.4"
+    version: "0.5"
     minGameVersion: 136
     hidden: true
     iosCompatible: true

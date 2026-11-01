@@ -1,5 +1,5 @@
 // Resource Rate Monitor
-// Shows per-resource production/consumption rates in the core item display.
+// Shows per-resource production/consumption rates and team power stats in the HUD.
 //
 // Platforms:
 // - desktop: replaces the vanilla core item widget inside the "coreinfo" HUD table
@@ -9,7 +9,8 @@
 // iOS notes:
 // - mod.hjson must declare iosCompatible: true (no JavaAdapter / extend() here)
 // - iOS runs Rhino interpreted, so keep per-frame work small: the table is only
-//   rebuilt when the visible item set or column count changes, values update in place
+//   rebuilt when the visible item set, power row or column count changes, and
+//   label strings are cached
 
 const SAMPLE_MS = 1000; // rate sampling window
 const TICK_MS = 100; // logic refresh
@@ -17,19 +18,28 @@ const SHOW_AT = 5; // show a resource once it reaches this amount
 const HIDE_AT = 0; // hide it again at or below this amount
 const FLICKER_MS = 3000; // reappearing under SHOW_AT within this window means flickering
 const COLUMN_OPTIONS = [4, 5, 6, 7, 8];
+const HIDDEN_KEY = 'rrm-hidden'; // persisted display toggle
+const BUTTON_SIZE = 26; // toggle button hit area, in UI units
 
 let diffs = {}; // item id -> state
 let columnIndex = 0;
 let visibleCount = 0;
+let hidden = false;
+
+let power = { valid: false, produced: 0, consumed: 0, net: 0, shortage: false };
 
 let desktopWrapper, desktopContent, desktopCollapser;
-let mobileRoot, mobileContent, mobileCell;
+let mobileRoot, mobileWrapper, mobileContent, mobileCell;
 let lastPadTop = -1, lastPadLeft = -1;
 
 let lastTick = 0;
+let lastPowerTick = 0;
 let lastSignature = null;
+let lastContentWidth = 0;
+let useTeamList = true; // v8+ keeps a live building list per team
 
 Events.on(ClientLoadEvent, () => {
+    hidden = Core.settings.getBool(HIDDEN_KEY, false);
     reset();
     buildDesktop();
     buildMobile();
@@ -46,21 +56,34 @@ Events.run(Trigger.update, () => {
 
     if (!Vars.state.isGame()) return;
 
-    if (!Vars.mobile) tryInjectDesktop();
-    if (Vars.mobile) {
+    if (!Vars.mobile) {
+        tryInjectDesktop();
+    } else {
         updateMobileLayout();
         // note: Element.visible is a boolean field, so it is assigned directly
         // instead of using the Boolp overload (which Rhino cannot resolve)
         mobileRoot.visible = Vars.ui.hudfrag.shown && !Vars.state.isMenu() && !Vars.state.isEditor();
     }
 
+    // remember how wide the table is, so the toggle keeps its place when hidden
+    if (!hidden && !Vars.mobile && desktopWrapper != null && desktopWrapper.getWidth() > 0) {
+        lastContentWidth = desktopWrapper.getWidth();
+    }
+
+    if (now - lastPowerTick >= SAMPLE_MS) {
+        lastPowerTick = now;
+        samplePower();
+    }
+
     const list = sample(now);
 
-    // only rebuild when the item set or column count changes; labels update themselves
-    const signature = columnIndex + '|' + list.map(item => item.id).join(',');
+    // only rebuild when the displayed content changes; labels update themselves
+    const signature = columnIndex + '|' + (hidden ? 'h' : 'v') + '|' + (power.valid ? 'p' : '') + '|'
+        + list.map(item => item.id).join(',');
+
     if (signature != lastSignature) {
         lastSignature = signature;
-        rebuild(list);
+        render(list);
     }
 });
 
@@ -70,33 +93,35 @@ function reset() {
     desktopCollapser = null;
     lastPadTop = -1;
     lastPadLeft = -1;
+    lastContentWidth = 0;
+    useTeamList = true;
+    power = { valid: false, produced: 0, consumed: 0, net: 0, shortage: false };
 }
 
 function buildDesktop() {
-    desktopContent = new Table(Styles.black6);
-    desktopContent.margin(4);
-    desktopContent.touchable = Touchable.enabled;
+    desktopWrapper = new Table(Styles.black6);
+    desktopWrapper.margin(4);
+    desktopWrapper.touchable = Touchable.childrenOnly;
 
-    desktopWrapper = new Table();
-    desktopWrapper.touchable = Touchable.enabled;
-    desktopWrapper.add(desktopContent);
-    desktopWrapper.row();
-    desktopWrapper.clicked(cycleColumns);
+    desktopContent = new Table();
+    desktopContent.touchable = Touchable.childrenOnly;
 }
 
 function buildMobile() {
     if (mobileRoot != null) return;
 
-    mobileContent = new Table(Styles.black6);
-    mobileContent.margin(4);
-    mobileContent.touchable = Touchable.enabled;
-    mobileContent.clicked(cycleColumns);
+    mobileWrapper = new Table(Styles.black6);
+    mobileWrapper.margin(4);
+    mobileWrapper.touchable = Touchable.childrenOnly;
+
+    mobileContent = new Table();
+    mobileContent.touchable = Touchable.childrenOnly;
 
     mobileRoot = new Table();
     mobileRoot.setFillParent(true);
     mobileRoot.top().left();
     mobileRoot.touchable = Touchable.childrenOnly;
-    mobileCell = mobileRoot.add(mobileContent).left();
+    mobileCell = mobileRoot.add(mobileWrapper).left();
 
     Vars.ui.hudGroup.addChild(mobileRoot);
 }
@@ -201,10 +226,87 @@ function sample(now) {
     return list;
 }
 
-function rebuild(list) {
-    const content = Vars.mobile ? mobileContent : desktopContent;
-    if (content == null) return;
+// v8 keeps a live list of every building per team; older versions need the entity group,
+// which is complete on those versions
+function eachTeamBuilding(team, cons) {
+    if (useTeamList) {
+        try {
+            const list = team.data().buildings;
+            if (list != null) {
+                list.each(cons);
+                return;
+            }
+        } catch (e) {
+            useTeamList = false;
+        }
+    }
+    Groups.build.each(cons);
+}
 
+// sums the player team's power networks
+function samplePower() {
+    const team = Vars.player.team();
+    const teamId = team.id;
+    const seen = {};
+    let produced = 0, net = 0, found = false;
+
+    eachTeamBuilding(team, b => {
+        if (b.team == null || b.team.id != teamId) return;
+
+        const module = b.power;
+        if (module == null || module.graph == null) return;
+
+        found = true;
+
+        // per-tick production, so this does not depend on the frame time
+        produced += b.getPowerProduction() * 60;
+
+        // the balance is a graph-wide value, so count each graph once
+        const id = module.graph.getID();
+        if (seen[id] == null) {
+            seen[id] = true;
+            net += module.graph.getPowerBalance() * 60;
+        }
+    });
+
+    power.produced = isFinite(produced) ? Math.min(Math.max(produced, 0), 1e15) : 1e15;
+    power.net = isFinite(net) ? Math.max(Math.min(net, 1e15), -1e15) : 0;
+    // consumption is derived from supply and the balance, so the numbers agree
+    power.consumed = Math.max(power.produced - power.net, 0);
+    power.shortage = power.net < -0.5;
+    // hide the row when the team has no power activity at all
+    power.valid = found && (power.produced > 0.5 || power.consumed > 0.5 || Math.abs(power.net) > 0.5);
+}
+
+function render(list) {
+    const wrapper = Vars.mobile ? mobileWrapper : desktopWrapper;
+    const content = Vars.mobile ? mobileContent : desktopContent;
+    if (wrapper == null || content == null) return;
+
+    wrapper.clearChildren();
+
+    // Buttons go on the left, clear of the minimap: the minimap fragment is added
+    // after the HUD fragment, so it shadows anything clickable under its corner.
+    // Cells are zero-sized unless a size is given, and a zero-sized button can
+    // never be hit, so the size is set explicitly.
+    // The eye always stays visible, so a hidden table can be brought back.
+    wrapper.button(hidden ? Icon.eyeOffSmall : Icon.eyeSmall, Styles.clearNonei, Scl.scl(16), toggleHidden)
+        .size(Scl.scl(BUTTON_SIZE)).left().top().padRight(Scl.scl(2));
+
+    if (!hidden) {
+        wrapper.button(Icon.list, Styles.clearNonei, Scl.scl(16), cycleColumns)
+            .size(Scl.scl(BUTTON_SIZE)).left().top().padRight(Scl.scl(4));
+
+        wrapper.add(content).left();
+        fillContent(content, list);
+    } else if (!Vars.mobile && lastContentWidth > 0) {
+        // the table is centered, so without a placeholder the toggle would jump
+        // when the readout is hidden
+        wrapper.add().size(Math.max(lastContentWidth - Scl.scl(BUTTON_SIZE), Scl.scl(BUTTON_SIZE)), Scl.scl(BUTTON_SIZE));
+    }
+}
+
+function fillContent(content, list) {
     content.clearChildren();
 
     const columns = COLUMN_OPTIONS[columnIndex];
@@ -212,14 +314,27 @@ function rebuild(list) {
 
     for (let n = 0; n < list.length; n++) {
         const item = list[n];
-        const id = item.id;
 
         content.image(item.uiIcon).left().padRight(2);
-        content.label(() => amountText(id)).left().padRight(2);
-        content.label(() => rateText(id)).left().padRight(8);
+        content.label(() => amountText(item.id)).left().padRight(2);
+        content.label(() => rateText(item.id)).left().padRight(8);
 
         if (++i % columns == 0) content.row();
     }
+
+    if (power.valid) {
+        if (i % columns != 0) content.row();
+
+        const icon = content.image(Icon.powerSmall).left().padRight(4).get();
+        icon.setColor(Pal.powerLight);
+        content.label(() => powerText()).left();
+    }
+}
+
+function toggleHidden() {
+    hidden = !hidden;
+    Core.settings.put(HIDDEN_KEY, hidden);
+    lastSignature = null; // forces a re-render
 }
 
 function amountText(id) {
@@ -257,6 +372,26 @@ function rateText(id) {
     }
     return d.rateStr;
 }
+
+function powerText() {
+    if (!power.valid) return '';
+
+    const key = power.produced + '|' + power.consumed + '|' + power.net + '|' + power.shortage;
+    if (key != powerKey) {
+        powerKey = key;
+
+        const net = Math.round(power.net);
+        const color = net > 0 ? '[#8585FF]' : net < 0 ? '[red]' : '[lightgray]';
+        const sign = net > 0 ? '+' : net < 0 ? '-' : '';
+
+        powerStr = (power.shortage ? '[red](!) [white]' : '')
+            + formatAmount(power.produced) + '[lightgray]/[white]' + formatAmount(power.consumed)
+            + ' (' + color + sign + formatAmount(Math.abs(net)) + '[white])';
+    }
+    return powerStr;
+}
+
+let powerKey = '', powerStr = '';
 
 function rateOf(d) {
     return d.smoothed.hasEnoughData() ? d.smoothed.mean() : d.rate;
