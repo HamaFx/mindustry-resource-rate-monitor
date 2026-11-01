@@ -11,7 +11,7 @@
     - [red](!)[] Low-stock warning when a resource is under 10 seconds from depletion
     - [yellow]Flicker detection[] for resources being consumed as fast as they arrive (~0)
     - Eye button hides or shows the display, and the choice is remembered
-    - Tap or click the table to cycle column count (4-8)
+    - List button cycles the column count (4-8)
     - Compact number formatting (1.5k, 2.3M, etc.)
     - Works on desktop, Android and iOS
     '''
