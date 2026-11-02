@@ -11,7 +11,7 @@ Fork of [derekShaheen/Mindustry-Resource-Rate-Monitor](https://github.com/derekS
 - Rate colors: gaining, losing, stable
 - `(!)` low-stock warning when a resource has under 10 seconds of supply left
 - Flicker detection for resources that are consumed as fast as they arrive (`~0`)
-- Power row with production, consumption and the net balance, plus a shortage warning
+- Power row with production, demand and the net balance, plus a shortage warning
 - Eye button hides or shows the readout, and the choice is remembered
 - List button cycles the column count (4 to 8)
 - Compact number formatting (1.5k, 2.3M, 12.4B)
@@ -58,10 +58,15 @@ A resource is shown once it holds at least 5 items, and hidden again at 0. Resou
 keep reappearing below the threshold within 3 seconds are treated as flickering and shown
 as `~0`.
 
-Power is summed over every network owned by your team. Production is read per tick, so it
-does not depend on the frame rate, the net balance comes from the game's own power graph
-average, and consumption is derived from the two so the numbers always agree. A red `(!)`
-marks a network running at a deficit.
+Power is summed over every network owned by your team, read through `Groups.powerGraph`.
+Each value comes from the game's own accounting for that network, the same data the vanilla
+power bar and Foo's Client display: `getLastScaledPowerIn` and `getLastScaledPowerOut` for
+production and demand, and `getPowerBalance` for the net. A red `(!)` marks a network whose
+demand is not being met.
 
 The table is only rebuilt when the visible item set, the power row or the column count
 changes, and label text is cached, so per-frame work stays small on mobile.
+
+Number formatting is done with integer math on purpose: `toFixed()` in Mindustry's Rhino
+rounds to significant digits instead of decimal places, so `(14).toFixed(1)` returns `"10.0"`
+and a core holding 14000 items would read `10k`.
